@@ -1,0 +1,29 @@
+# Dependencies
+node_modules/
+
+# Environment files (NEVER commit credentials)
+.env
+.env.local
+.env.*.local
+
+# Output files
+*.json
+!package.json
+!package-lock.json
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Logs
+*.log
+
+# Temporary files
+*.tmp
+*.temp

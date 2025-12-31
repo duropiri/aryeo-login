@@ -1,0 +1,23 @@
+{
+  "name": "aryeo-login",
+  "version": "1.0.0",
+  "description": "Headless login and cookie extractor for Aryeo",
+  "type": "module",
+  "main": "login_and_cookies.mjs",
+  "scripts": {
+    "start": "node login_and_cookies.mjs",
+    "smoke": "ARYEO_SMOKE_TEST=1 node login_and_cookies.mjs",
+    "postinstall": "npx playwright install chromium"
+  },
+  "keywords": [
+    "aryeo",
+    "playwright",
+    "login",
+    "cookies",
+    "headless"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "playwright": "^1.40.0"
+  }
+}
