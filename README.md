@@ -4,9 +4,10 @@ Headless browser login and session extractor for Aryeo using Playwright.
 
 ## Overview
 
-This tool automates Aryeo login and extracts session data in two formats:
+This tool automates Aryeo login and extracts session data in multiple formats:
 - **Cookie headers** for direct HTTP requests
-- **Playwright storage state** for browser automation (compatible with [aryeo-delivery-runner](https://github.com/duropiri/aryeo-runner))
+- **Runner auth payload** for pushing to [aryeo-delivery-runner](https://github.com/duropiri/aryeo-runner) `/auth/cookies` endpoint
+- **Playwright storage state** for browser automation
 
 > **Note:** This is browser-session replay, not an API integration. Aryeo does not expose a public API for authentication. Sessions can be invalidated at any time (logout, security events, idle timeout). Plan for re-authentication.
 
@@ -16,8 +17,12 @@ This tool automates Aryeo login and extracts session data in two formats:
 # Install
 npm install
 
-# Login and extract session
+# Login and extract session (output to stdout)
 ARYEO_EMAIL="your@email.com" ARYEO_PASSWORD="your-password" npm start
+
+# Push auth directly to runner
+ARYEO_EMAIL="your@email.com" ARYEO_PASSWORD="your-password" \
+  npm start -- --runner-url https://runner.example.com --runner-token YOUR_TOKEN --push-auth
 ```
 
 ## Installation
@@ -46,6 +51,17 @@ This installs Playwright and downloads Chromium automatically.
 | `ARYEO_DEBUG` | No | Set to `1` for debug logging |
 
 *Not required for smoke test mode
+
+## CLI Options
+
+| Flag | Description |
+|------|-------------|
+| `--output-payload <path>` | Save runner auth payload to file (for POST /auth/cookies) |
+| `--runner-url <url>` | Runner base URL for push (e.g., `https://runner.example.com`) |
+| `--runner-token <token>` | Bearer token for runner API |
+| `--push-auth` | POST auth payload to runner `/auth/cookies` endpoint |
+| `--export-storage-state <path>` | Export Playwright storage state to file |
+| `--help, -h` | Show usage help |
 
 ## Usage
 
@@ -118,17 +134,54 @@ JSON to stdout on success:
 
 ## Integration with aryeo-delivery-runner
 
-The `playwrightStorageState` output can be pushed directly to the [aryeo-delivery-runner](https://github.com/duropiri/aryeo-runner) API:
+Multiple methods to push auth to the [aryeo-delivery-runner](https://github.com/duropiri/aryeo-runner):
 
-### Extract and Save Locally
+### Method 1: Direct Push (Recommended)
 
 ```bash
-# Run login and save storage state
-ARYEO_EMAIL="your@email.com" ARYEO_PASSWORD="your-password" npm start \
-  | jq '.playwrightStorageState' > aryeo-storage-state.json
+# Push auth directly to runner /auth/cookies endpoint
+ARYEO_EMAIL="your@email.com" ARYEO_PASSWORD="your-password" \
+  npm start -- \
+    --runner-url https://runner.yourdomain.com \
+    --runner-token YOUR_RUNNER_TOKEN \
+    --push-auth
 ```
 
-### Push to Runner API
+Output:
+```
+[INFO] Runner push successful: 4 cookies, names: XSRF-TOKEN, aryeo_session
+{ "cookieHeader": "...", "xsrfHeader": "...", ... }
+```
+
+### Method 2: Save Payload File, Then Push
+
+```bash
+# Step 1: Save runner auth payload to file
+ARYEO_EMAIL="your@email.com" ARYEO_PASSWORD="your-password" \
+  npm start -- --output-payload ./auth-payload.json
+
+# Step 2: Push to runner with curl
+curl -X POST https://runner.yourdomain.com/auth/cookies \
+  -H "Authorization: Bearer YOUR_RUNNER_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d @auth-payload.json
+```
+
+### Method 3: Export Playwright Storage State
+
+```bash
+# Export storage state directly to file
+ARYEO_EMAIL="your@email.com" ARYEO_PASSWORD="your-password" \
+  npm start -- --export-storage-state ./storage-state.json
+
+# Push storage state to runner
+curl -X POST https://runner.yourdomain.com/auth/storage-state \
+  -H "Authorization: Bearer YOUR_RUNNER_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d @storage-state.json
+```
+
+### Method 4: Pipe from stdout (Legacy)
 
 ```bash
 # Extract storage state and push to runner
@@ -143,11 +196,11 @@ ARYEO_EMAIL="your@email.com" ARYEO_PASSWORD="your-password" npm start \
 ### SCP to Server
 
 ```bash
-# Save locally then copy to server
-ARYEO_EMAIL="your@email.com" ARYEO_PASSWORD="your-password" npm start \
-  | jq '.playwrightStorageState' > aryeo-storage-state.json
+# Export and copy to server
+ARYEO_EMAIL="your@email.com" ARYEO_PASSWORD="your-password" \
+  npm start -- --export-storage-state ./storage-state.json
 
-scp aryeo-storage-state.json user@server:/opt/aryeo-runner/data/auth/
+scp storage-state.json user@server:/opt/aryeo-runner/data/auth/
 ```
 
 ## n8n Integration

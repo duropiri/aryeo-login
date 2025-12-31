@@ -4,10 +4,105 @@
  *
  * Automates browser login to Aryeo and extracts session cookies for replay.
  * This is browser-session replay, NOT an API integration.
+ *
+ * CLI Flags:
+ *   --output-payload <path>       Write runner auth payload to file
+ *   --runner-url <url>            Runner base URL for push
+ *   --runner-token <token>        Runner auth token
+ *   --push-auth                   POST auth payload to runner /auth/cookies
+ *   --export-storage-state <path> Export Playwright storage state to file
+ *   --help                        Show usage
  */
 
 import { chromium } from 'playwright';
 import { createHmac } from 'crypto';
+import fs from 'fs';
+import https from 'https';
+import http from 'http';
+import { URL } from 'url';
+
+// =============================================================================
+// CLI Argument Parsing
+// =============================================================================
+
+function parseArgs(argv) {
+  const args = {
+    outputPayload: null,
+    runnerUrl: null,
+    runnerToken: null,
+    pushAuth: false,
+    exportStorageState: null,
+    help: false,
+  };
+
+  for (let i = 2; i < argv.length; i++) {
+    const arg = argv[i];
+    switch (arg) {
+      case '--output-payload':
+        args.outputPayload = argv[++i];
+        break;
+      case '--runner-url':
+        args.runnerUrl = argv[++i];
+        break;
+      case '--runner-token':
+        args.runnerToken = argv[++i];
+        break;
+      case '--push-auth':
+        args.pushAuth = true;
+        break;
+      case '--export-storage-state':
+        args.exportStorageState = argv[++i];
+        break;
+      case '--help':
+      case '-h':
+        args.help = true;
+        break;
+    }
+  }
+
+  return args;
+}
+
+const CLI_ARGS = parseArgs(process.argv);
+
+function showHelp() {
+  console.log(`
+Aryeo Login - Headless login and session extractor
+
+Usage:
+  node login_and_cookies.mjs [options]
+
+Environment Variables:
+  ARYEO_EMAIL           Aryeo account email (required)
+  ARYEO_PASSWORD        Aryeo account password (required)
+  ARYEO_TOTP_SECRET     TOTP secret for automatic MFA
+  ARYEO_OTP             Manual OTP code
+  ARYEO_SMOKE_TEST=1    Run smoke test only
+  ARYEO_HEADLESS=0      Show browser window
+  ARYEO_DEBUG=1         Enable debug logging
+
+CLI Options:
+  --output-payload <path>       Save runner auth payload to file
+  --runner-url <url>            Runner base URL (e.g., https://runner.example.com)
+  --runner-token <token>        Bearer token for runner API
+  --push-auth                   POST auth payload to runner /auth/cookies
+  --export-storage-state <path> Export Playwright storage state to file
+  --help, -h                    Show this help
+
+Examples:
+  # Basic login (output to stdout)
+  ARYEO_EMAIL="user@example.com" ARYEO_PASSWORD="pass" npm start
+
+  # Save runner payload to file
+  npm start -- --output-payload ./auth-payload.json
+
+  # Push auth directly to runner
+  npm start -- --runner-url https://runner.example.com --runner-token TOKEN --push-auth
+
+  # Export Playwright storage state
+  npm start -- --export-storage-state ./storage-state.json
+`);
+}
 
 // =============================================================================
 // Configuration
@@ -459,6 +554,8 @@ async function extractCookies(context) {
     xsrfHeader,
     expiresAt,
     debugDomains: domains,
+    // Include raw cookies for storage state export (not in stdout output)
+    _rawCookies: domainCookies,
   };
 }
 
@@ -742,10 +839,132 @@ async function runSmokeTest(page, context) {
 }
 
 // =============================================================================
+// Runner Auth Payload & Push
+// =============================================================================
+
+/**
+ * Create runner auth payload suitable for POST /auth/cookies
+ */
+function createRunnerAuthPayload(result) {
+  return {
+    cookieHeader: result.cookieHeader,
+    xsrfHeader: result.xsrfHeader,
+    expiresAt: result.expiresAt,
+  };
+}
+
+/**
+ * Push auth payload to runner /auth/cookies endpoint
+ */
+async function pushAuthToRunner(payload, runnerUrl, runnerToken) {
+  return new Promise((resolve, reject) => {
+    const url = new URL('/auth/cookies', runnerUrl);
+    const isHttps = url.protocol === 'https:';
+    const client = isHttps ? https : http;
+
+    const postData = JSON.stringify(payload);
+
+    const options = {
+      hostname: url.hostname,
+      port: url.port || (isHttps ? 443 : 80),
+      path: url.pathname,
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(postData),
+        'Authorization': `Bearer ${runnerToken}`,
+      },
+    };
+
+    log(`Pushing auth to: ${url.toString()}`);
+
+    const req = client.request(options, (res) => {
+      let data = '';
+      res.on('data', (chunk) => { data += chunk; });
+      res.on('end', () => {
+        try {
+          const response = JSON.parse(data);
+          if (res.statusCode >= 200 && res.statusCode < 300) {
+            resolve({ statusCode: res.statusCode, body: response });
+          } else {
+            reject(new Error(`Runner returned ${res.statusCode}: ${JSON.stringify(response)}`));
+          }
+        } catch (e) {
+          reject(new Error(`Failed to parse runner response: ${data}`));
+        }
+      });
+    });
+
+    req.on('error', (e) => {
+      reject(new Error(`Failed to connect to runner: ${e.message}`));
+    });
+
+    req.write(postData);
+    req.end();
+  });
+}
+
+// =============================================================================
+// Playwright Storage State Export
+// =============================================================================
+
+/**
+ * Convert browser cookies to Playwright storage state format
+ */
+function createPlaywrightStorageState(cookies) {
+  // Convert to Playwright cookie format
+  const playwrightCookies = cookies.map((c) => ({
+    name: c.name,
+    value: c.value,
+    domain: c.domain,
+    path: c.path,
+    expires: c.expires,
+    httpOnly: c.httpOnly,
+    secure: c.secure,
+    sameSite: c.sameSite,
+  }));
+
+  return {
+    cookies: playwrightCookies,
+    origins: [],
+  };
+}
+
+/**
+ * Export Playwright storage state to file
+ */
+function exportStorageState(storageState, filePath) {
+  const content = JSON.stringify(storageState, null, 2);
+  fs.writeFileSync(filePath, content, { mode: 0o600 });
+  log(`Exported Playwright storage state to: ${filePath}`);
+  return {
+    path: filePath,
+    cookieCount: storageState.cookies.length,
+    cookieNames: [...new Set(storageState.cookies.map(c => c.name))],
+  };
+}
+
+// =============================================================================
 // Main Entry Point
 // =============================================================================
 
 async function main() {
+  // Show help if requested
+  if (CLI_ARGS.help) {
+    showHelp();
+    process.exit(0);
+  }
+
+  // Validate CLI args for push
+  if (CLI_ARGS.pushAuth) {
+    if (!CLI_ARGS.runnerUrl) {
+      fatal('--runner-url is required when using --push-auth', 'CONFIG_ERROR');
+    }
+    if (!CLI_ARGS.runnerToken) {
+      fatal('--runner-token is required when using --push-auth', 'CONFIG_ERROR');
+    }
+  }
+
   // Validate configuration
   if (!CONFIG.smokeTest) {
     if (!CONFIG.email) {
@@ -785,6 +1004,42 @@ async function main() {
       result = await runSmokeTest(page, context);
     } else {
       result = await performLogin(page, context);
+    }
+
+    // Extract raw cookies before cleaning result for output
+    const rawCookies = result._rawCookies;
+    delete result._rawCookies;
+
+    // Handle --output-payload: save runner auth payload to file
+    if (CLI_ARGS.outputPayload && !CONFIG.smokeTest) {
+      const payload = createRunnerAuthPayload(result);
+      fs.writeFileSync(CLI_ARGS.outputPayload, JSON.stringify(payload, null, 2), { mode: 0o600 });
+      log(`Runner auth payload saved to: ${CLI_ARGS.outputPayload}`);
+      console.error(`[INFO] Saved runner auth payload to: ${CLI_ARGS.outputPayload}`);
+    }
+
+    // Handle --push-auth: POST to runner /auth/cookies
+    if (CLI_ARGS.pushAuth && !CONFIG.smokeTest) {
+      const payload = createRunnerAuthPayload(result);
+      try {
+        const pushResult = await pushAuthToRunner(payload, CLI_ARGS.runnerUrl, CLI_ARGS.runnerToken);
+        console.error(`[INFO] Runner push successful: ${pushResult.body.cookieCount} cookies, names: ${pushResult.body.cookieNames?.join(', ') || 'N/A'}`);
+      } catch (pushErr) {
+        error(`Runner push failed: ${pushErr.message}`, 'RUNNER_PUSH_FAILED');
+        // Don't exit - still output the result
+      }
+    }
+
+    // Handle --export-storage-state: export Playwright storage state
+    if (CLI_ARGS.exportStorageState && !CONFIG.smokeTest && rawCookies) {
+      const storageState = createPlaywrightStorageState(rawCookies);
+      const exportResult = exportStorageState(storageState, CLI_ARGS.exportStorageState);
+      console.error(`[INFO] Exported storage state: ${exportResult.cookieCount} cookies to ${exportResult.path}`);
+    }
+
+    // Add playwrightStorageState to output if we have raw cookies (for backward compat with README examples)
+    if (rawCookies && !CONFIG.smokeTest) {
+      result.playwrightStorageState = createPlaywrightStorageState(rawCookies);
     }
 
     // Output result as JSON to stdout
