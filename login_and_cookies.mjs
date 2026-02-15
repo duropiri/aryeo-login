@@ -581,8 +581,13 @@ async function navigateToLogin(page) {
       }
 
       const status = response.status();
-      if (status >= 400) {
+      // Treat only 5xx as hard failure.
+      // 4xx (notably 405/409) may still return usable HTML/redirect behavior.
+      if (status >= 500) {
         throw new Error(`HTTP ${status}`);
+      }
+      if (status >= 400) {
+        warn(`Login URL returned HTTP ${status} (continuing)`);
       }
 
       await waitForStable(page);
@@ -690,12 +695,52 @@ async function verifyLoginWithSubdomain(page) {
  * Perform the complete login flow
  */
 async function performLogin(page, context) {
+  // Step 0: Try protected page first (best case: already authenticated)
+  log('Step: Try postLoginUrl first (session reuse)');
+  try {
+    const precheckResponse = await page.goto(CONFIG.postLoginUrl, {
+      waitUntil: 'commit',
+      timeout: CONFIG.timeout,
+    });
+    await page.waitForTimeout(1200);
+
+    const landedUrl = page.url();
+    const status = precheckResponse?.status() || 0;
+    log(`Landed on: ${landedUrl} (HTTP ${status})`);
+
+    // If we are not on a login page, assume session is valid.
+    if (!landedUrl.toLowerCase().includes('/login')) {
+      log('Session appears valid; extracting cookies');
+      return await extractCookies(context);
+    }
+  } catch (err) {
+    warn(`postLoginUrl pre-check failed: ${err.message} (continuing to login flow)`);
+  }
+
   // Step 1: Navigate to login page
   await navigateToLogin(page);
 
   // Step 2: Enter email
   log('Step: Enter email');
-  const emailInput = await findElement(page, 'email');
+  // If already on dashboard/admin and no email field appears quickly, treat as authenticated.
+  const quickEmail = await findElement(page, 'email', {
+    required: false,
+    timeout: 1500,
+    retries: 1,
+  });
+  if (!quickEmail) {
+    const currentUrl = page.url().toLowerCase();
+    if (!currentUrl.includes('/login')) {
+      log('No email field and not on login page; treating as already authenticated');
+      await verifyLoginWithSubdomain(page);
+      return await extractCookies(context);
+    }
+    throw new LoginError(
+      'Expected login page but no email field found.',
+      ERROR_CODES.SELECTOR_NOT_FOUND
+    );
+  }
+  const emailInput = quickEmail;
   await emailInput.click();
   await emailInput.fill(CONFIG.email);
 
