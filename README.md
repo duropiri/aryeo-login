@@ -1,39 +1,17 @@
-# Aryeo Login
+# Aryeo Headless Login & Cookie Extractor
 
-Headless browser login and session extractor for Aryeo using Playwright.
+Headless browser login and cookie extractor for Aryeo using Playwright.
 
-## Overview
-
-This tool automates Aryeo login and extracts session data in multiple formats:
-- **Cookie headers** for direct HTTP requests
-- **Runner auth payload** for pushing to [aryeo-delivery-runner](https://github.com/duropiri/aryeo-runner) `/auth/cookies` endpoint
-- **Playwright storage state** for browser automation
-
-> **Note:** This is browser-session replay, not an API integration. Aryeo does not expose a public API for authentication. Sessions can be invalidated at any time (logout, security events, idle timeout). Plan for re-authentication.
-
-## Quick Start
-
-```bash
-# Install
-npm install
-
-# Login and extract session (output to stdout)
-ARYEO_EMAIL="your@email.com" ARYEO_PASSWORD="your-password" npm start
-
-# Push auth directly to runner
-ARYEO_EMAIL="your@email.com" ARYEO_PASSWORD="your-password" \
-  npm start -- --runner-url https://runner.example.com --runner-token YOUR_TOKEN --push-auth
-```
+**This is browser-session replay, not an API integration.** Aryeo does not expose a public API for this functionality. This tool automates browser login and extracts session cookies for replay. Sessions can be invalidated by Aryeo at any time (logout, security events, server restarts, idle timeout). Plan for re-authentication on every workflow run.
 
 ## Installation
 
 ```bash
-git clone https://github.com/duropiri/aryeo-login.git
 cd aryeo-login
 npm install
 ```
 
-This installs Playwright and downloads Chromium automatically.
+Installs Playwright and downloads Chromium.
 
 ## Environment Variables
 
@@ -42,26 +20,20 @@ This installs Playwright and downloads Chromium automatically.
 | `ARYEO_EMAIL` | Yes* | Aryeo account email |
 | `ARYEO_PASSWORD` | Yes* | Aryeo account password |
 | `ARYEO_OTP` | No | Manual OTP code (TOTP-based MFA only) |
-| `ARYEO_TOTP_SECRET` | No | Base32 TOTP secret for automatic code generation |
+| `ARYEO_TOTP_SECRET` | No | Base32 TOTP secret for automatic code generation (RFC 6238) |
 | `ARYEO_LOGIN_URL` | No | Login URL (default: `https://app.aryeo.com/login`) |
 | `ARYEO_POST_LOGIN_URL` | No | URL to verify login (default: `https://virtual-xposure.aryeo.com/admin/mileage`) |
 | `ARYEO_SMOKE_TEST` | No | Set to `1` for smoke test mode |
 | `ARYEO_HEADLESS` | No | Set to `0` to show browser (debugging) |
 | `ARYEO_TIMEOUT` | No | Timeout in ms (default: `30000`) |
-| `ARYEO_DEBUG` | No | Set to `1` for debug logging |
+| `ARYEO_DEBUG` | No | Set to `1` for debug logging to stderr |
 
 *Not required for smoke test mode
 
-## CLI Options
+### MFA Support
 
-| Flag | Description |
-|------|-------------|
-| `--output-payload <path>` | Save runner auth payload to file (for POST /auth/cookies) |
-| `--runner-url <url>` | Runner base URL for push (e.g., `https://runner.example.com`) |
-| `--runner-token <token>` | Bearer token for runner API |
-| `--push-auth` | POST auth payload to runner `/auth/cookies` endpoint |
-| `--export-storage-state <path>` | Export Playwright storage state to file |
-| `--help, -h` | Show usage help |
+- **TOTP-based MFA**: Supported via `ARYEO_TOTP_SECRET` (automatic) or `ARYEO_OTP` (manual). Only works if your Aryeo account uses TOTP (authenticator app).
+- **Email/SMS magic links**: Not supported. These require intercepting email/SMS which needs separate automation.
 
 ## Usage
 
@@ -73,7 +45,9 @@ export ARYEO_PASSWORD="your-password"
 npm start
 ```
 
-### With TOTP (Automatic MFA)
+### With TOTP (Automatic OTP)
+
+For accounts with TOTP-based MFA (authenticator app):
 
 ```bash
 export ARYEO_EMAIL="your@email.com"
@@ -105,108 +79,22 @@ JSON to stdout on success:
   "cookieHeader": "XSRF-TOKEN=eyJp...%3D; aryeo_session=eyJp...",
   "xsrfHeader": "eyJp...=",
   "expiresAt": "2025-01-15T12:00:00.000Z",
-  "debugDomains": [".aryeo.com", "app.aryeo.com"],
-  "playwrightStorageState": {
-    "cookies": [
-      {
-        "name": "XSRF-TOKEN",
-        "value": "eyJp...",
-        "domain": ".aryeo.com",
-        "path": "/",
-        "expires": 1736942400,
-        "httpOnly": false,
-        "secure": true,
-        "sameSite": "Lax"
-      }
-    ],
-    "origins": []
-  }
+  "debugDomains": [".aryeo.com", "app.aryeo.com"]
 }
 ```
 
 | Field | Description |
 |-------|-------------|
-| `cookieHeader` | Value for `Cookie` HTTP header |
-| `xsrfHeader` | URL-decoded XSRF token for `X-XSRF-TOKEN` header |
-| `expiresAt` | Soonest cookie expiration (ISO 8601) or `null` |
-| `debugDomains` | All cookie domains observed |
-| `playwrightStorageState` | Playwright-compatible storage state for browser automation |
-
-## Integration with aryeo-delivery-runner
-
-Multiple methods to push auth to the [aryeo-delivery-runner](https://github.com/duropiri/aryeo-runner):
-
-### Method 1: Direct Push (Recommended)
-
-```bash
-# Push auth directly to runner /auth/cookies endpoint
-ARYEO_EMAIL="your@email.com" ARYEO_PASSWORD="your-password" \
-  npm start -- \
-    --runner-url https://runner.yourdomain.com \
-    --runner-token YOUR_RUNNER_TOKEN \
-    --push-auth
-```
-
-Output:
-```
-[INFO] Runner push successful: 4 cookies, names: XSRF-TOKEN, aryeo_session
-{ "cookieHeader": "...", "xsrfHeader": "...", ... }
-```
-
-### Method 2: Save Payload File, Then Push
-
-```bash
-# Step 1: Save runner auth payload to file
-ARYEO_EMAIL="your@email.com" ARYEO_PASSWORD="your-password" \
-  npm start -- --output-payload ./auth-payload.json
-
-# Step 2: Push to runner with curl
-curl -X POST https://runner.yourdomain.com/auth/cookies \
-  -H "Authorization: Bearer YOUR_RUNNER_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d @auth-payload.json
-```
-
-### Method 3: Export Playwright Storage State
-
-```bash
-# Export storage state directly to file
-ARYEO_EMAIL="your@email.com" ARYEO_PASSWORD="your-password" \
-  npm start -- --export-storage-state ./storage-state.json
-
-# Push storage state to runner
-curl -X POST https://runner.yourdomain.com/auth/storage-state \
-  -H "Authorization: Bearer YOUR_RUNNER_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d @storage-state.json
-```
-
-### Method 4: Pipe from stdout (Legacy)
-
-```bash
-# Extract storage state and push to runner
-ARYEO_EMAIL="your@email.com" ARYEO_PASSWORD="your-password" npm start \
-  | jq '.playwrightStorageState' \
-  | curl -X POST https://runner.yourdomain.com/auth/storage-state \
-      -H "Authorization: Bearer YOUR_RUNNER_TOKEN" \
-      -H "Content-Type: application/json" \
-      -d @-
-```
-
-### SCP to Server
-
-```bash
-# Export and copy to server
-ARYEO_EMAIL="your@email.com" ARYEO_PASSWORD="your-password" \
-  npm start -- --export-storage-state ./storage-state.json
-
-scp storage-state.json user@server:/opt/aryeo-runner/data/auth/
-```
+| `cookieHeader` | Value for `cookie` header. Cookies scoped to `.aryeo.com` (works across subdomains). |
+| `xsrfHeader` | URL-decoded XSRF token for `x-xsrf-token` header. |
+| `expiresAt` | Cookie expiration (ISO 8601) or `null`. **Do not rely on this; sessions can be invalidated at any time.** |
+| `debugDomains` | All cookie domains observed. |
 
 ## n8n Integration
 
 ### Execute Command Node
 
+Command:
 ```
 node /path/to/aryeo-login/login_and_cookies.mjs
 ```
@@ -214,6 +102,8 @@ node /path/to/aryeo-login/login_and_cookies.mjs
 Set environment variables in the node or globally in n8n.
 
 ### Parse Output (Code Node)
+
+The Execute Command output structure varies by n8n version. Use defensive parsing:
 
 ```javascript
 const item = $input.first().json;
@@ -241,31 +131,17 @@ return [{ json: result }];
 
 ### HTTP Request Headers
 
+Required headers for authenticated requests:
+
 | Header | Value |
 |--------|-------|
-| `Cookie` | `{{ $json.cookieHeader }}` |
-| `X-XSRF-TOKEN` | `{{ $json.xsrfHeader }}` |
+| `cookie` | `{{ $json.cookieHeader }}` |
+| `x-xsrf-token` | `{{ $json.xsrfHeader }}` |
 | `X-Inertia` | `true` |
 | `Accept` | `application/json` |
 | `X-Requested-With` | `XMLHttpRequest` |
 
-## MFA Support
-
-| Type | Supported | Notes |
-|------|-----------|-------|
-| TOTP (Authenticator App) | Yes | Via `ARYEO_TOTP_SECRET` or `ARYEO_OTP` |
-| Email Magic Link | No | Requires email interception |
-| SMS Code | No | Requires SMS interception |
-
-### Getting Your TOTP Secret
-
-1. Go to Aryeo account security settings
-2. Enable two-factor authentication (select authenticator app)
-3. Click "Manual entry" or "Can't scan?"
-4. Copy the base32 secret (e.g., `JBSWY3DPEHPK3PXP`)
-5. Set `ARYEO_TOTP_SECRET`
-
-## Auto-Refresh Pattern
+## Health Check & Auto-Refresh
 
 Sessions are not reliable. Detect failures and re-authenticate.
 
@@ -275,7 +151,9 @@ Sessions are not reliable. Detect failures and re-authenticate.
 - HTTP 401 Unauthorized
 - HTTP 419 Session Expired (Laravel CSRF mismatch)
 
-### n8n Auto-Refresh
+### n8n Auto-Refresh Pattern
+
+After HTTP Request node, add an IF node to detect auth failure:
 
 ```javascript
 const statusCode = $input.first().json.statusCode ?? 200;
@@ -290,37 +168,67 @@ const isAuthFailure =
 return isAuthFailure;
 ```
 
-Flow:
+On failure:
+1. Re-run login script (Execute Command)
+2. Parse new cookies (Code node)
+3. Retry request with new cookies (HTTP Request)
+4. Limit to 1 retry to avoid loops
+
 ```
 HTTP Request → IF (auth failure?)
   ├─ No  → Continue
   └─ Yes → Login → Parse → Retry → Continue
 ```
 
+## Getting Your TOTP Secret
+
+1. Go to Aryeo account security settings
+2. Enable two-factor authentication (must be TOTP/authenticator app, not email/SMS)
+3. When shown the QR code, select "Manual entry" or "Can't scan?"
+4. Copy the base32 secret (e.g., `JBSWY3DPEHPK3PXP`)
+5. Set `ARYEO_TOTP_SECRET`
+
 ## Troubleshooting
 
-| Issue | Solution |
-|-------|----------|
-| "XSRF-TOKEN cookie not found" | Run smoke test: `npm run smoke` |
-| "Redirected back to login" | Check credentials, MFA, or run debug mode |
-| "OTP verification failed" | Verify TOTP secret, check system clock |
-| Timeout errors | Increase: `ARYEO_TIMEOUT=60000 npm start` |
-| Browser not found | Run: `npx playwright install chromium` |
+### "XSRF-TOKEN cookie not found"
+
+- Run smoke test: `npm run smoke`
+- Check if bot protection is blocking headless access
+
+### "Redirected back to login page"
+
+- Credentials may be wrong
+- MFA may be required
+- Session may have been invalidated server-side
+- Run debug mode: `ARYEO_HEADLESS=0 ARYEO_DEBUG=1 npm start`
+
+### "OTP verification failed"
+
+- Verify TOTP secret is correct base32
+- Check system clock synchronization (TOTP is time-sensitive)
+- If using email/SMS MFA, this tool cannot handle it
+
+### Timeout errors
+
+- Increase timeout: `ARYEO_TIMEOUT=60000 npm start`
+- Check network connectivity
+
+### Browser not found
+
+```bash
+npx playwright install chromium
+```
 
 ## Exit Codes
 
 | Code | Meaning |
 |------|---------|
-| 0 | Success (JSON on stdout) |
-| 1 | Failure (error on stderr) |
+| 0 | Success (JSON output on stdout) |
+| 1 | Failure (error message on stderr) |
 
 ## Security
 
-- Never commit credentials
-- Use environment variables or a secrets manager
-- Re-authenticate as needed (don't cache sessions indefinitely)
+- Do not commit credentials
+- Use environment variables or secrets manager
+- Do not cache sessions; re-authenticate as needed
 - Rotate credentials periodically
-
-## License
-
-MIT

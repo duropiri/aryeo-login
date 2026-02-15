@@ -4,105 +4,12 @@
  *
  * Automates browser login to Aryeo and extracts session cookies for replay.
  * This is browser-session replay, NOT an API integration.
- *
- * CLI Flags:
- *   --output-payload <path>       Write runner auth payload to file
- *   --runner-url <url>            Runner base URL for push
- *   --runner-token <token>        Runner auth token
- *   --push-auth                   POST auth payload to runner /auth/cookies
- *   --export-storage-state <path> Export Playwright storage state to file
- *   --help                        Show usage
  */
 
 import { chromium } from 'playwright';
 import { createHmac } from 'crypto';
-import fs from 'fs';
-import https from 'https';
-import http from 'http';
-import { URL } from 'url';
-
-// =============================================================================
-// CLI Argument Parsing
-// =============================================================================
-
-function parseArgs(argv) {
-  const args = {
-    outputPayload: null,
-    runnerUrl: null,
-    runnerToken: null,
-    pushAuth: false,
-    exportStorageState: null,
-    help: false,
-  };
-
-  for (let i = 2; i < argv.length; i++) {
-    const arg = argv[i];
-    switch (arg) {
-      case '--output-payload':
-        args.outputPayload = argv[++i];
-        break;
-      case '--runner-url':
-        args.runnerUrl = argv[++i];
-        break;
-      case '--runner-token':
-        args.runnerToken = argv[++i];
-        break;
-      case '--push-auth':
-        args.pushAuth = true;
-        break;
-      case '--export-storage-state':
-        args.exportStorageState = argv[++i];
-        break;
-      case '--help':
-      case '-h':
-        args.help = true;
-        break;
-    }
-  }
-
-  return args;
-}
-
-const CLI_ARGS = parseArgs(process.argv);
-
-function showHelp() {
-  console.log(`
-Aryeo Login - Headless login and session extractor
-
-Usage:
-  node login_and_cookies.mjs [options]
-
-Environment Variables:
-  ARYEO_EMAIL           Aryeo account email (required)
-  ARYEO_PASSWORD        Aryeo account password (required)
-  ARYEO_TOTP_SECRET     TOTP secret for automatic MFA
-  ARYEO_OTP             Manual OTP code
-  ARYEO_SMOKE_TEST=1    Run smoke test only
-  ARYEO_HEADLESS=0      Show browser window
-  ARYEO_DEBUG=1         Enable debug logging
-
-CLI Options:
-  --output-payload <path>       Save runner auth payload to file
-  --runner-url <url>            Runner base URL (e.g., https://runner.example.com)
-  --runner-token <token>        Bearer token for runner API
-  --push-auth                   POST auth payload to runner /auth/cookies
-  --export-storage-state <path> Export Playwright storage state to file
-  --help, -h                    Show this help
-
-Examples:
-  # Basic login (output to stdout)
-  ARYEO_EMAIL="user@example.com" ARYEO_PASSWORD="pass" npm start
-
-  # Save runner payload to file
-  npm start -- --output-payload ./auth-payload.json
-
-  # Push auth directly to runner
-  npm start -- --runner-url https://runner.example.com --runner-token TOKEN --push-auth
-
-  # Export Playwright storage state
-  npm start -- --export-storage-state ./storage-state.json
-`);
-}
+import fs from "node:fs";
+import path from "node:path";
 
 // =============================================================================
 // Configuration
@@ -114,7 +21,7 @@ const CONFIG = {
   otp: process.env.ARYEO_OTP,
   totpSecret: process.env.ARYEO_TOTP_SECRET,
   loginUrl: process.env.ARYEO_LOGIN_URL || 'https://app.aryeo.com/login',
-  postLoginUrl: process.env.ARYEO_POST_LOGIN_URL || 'https://app.aryeo.com/admin/mileage',
+  postLoginUrl: process.env.ARYEO_POST_LOGIN_URL || 'https://virtual-xposure.aryeo.com/admin/mileage',
   smokeTest: process.env.ARYEO_SMOKE_TEST === '1',
   headless: process.env.ARYEO_HEADLESS !== '0',
   timeout: parseInt(process.env.ARYEO_TIMEOUT || '30000', 10),
@@ -122,6 +29,9 @@ const CONFIG = {
   retryAttempts: parseInt(process.env.ARYEO_RETRY_ATTEMPTS || '3', 10),
   debug: process.env.ARYEO_DEBUG === '1',
 };
+
+const CAPTURE_NETWORK = process.env.ARYEO_CAPTURE_NETWORK === "1";
+const CAPTURE_URL = process.env.ARYEO_CAPTURE_URL || "https://virtual-xposure.aryeo.com/admin/mileage";
 
 // =============================================================================
 // Error Classes
@@ -170,6 +80,28 @@ function error(message, code = null) {
 function fatal(message, code = null) {
   error(message, code);
   process.exit(1);
+}
+
+async function dumpDebug(page, label) {
+  if (!CONFIG.debug) return;
+
+  try {
+    const dir = process.env.ARYEO_PROFILE_DIR || "/home/pw/profile";
+    const ts = new Date().toISOString().replace(/[:.]/g, "-");
+    const base = path.join(dir, `debug-${label}-${ts}`);
+
+    const url = page.url();
+    fs.writeFileSync(`${base}.txt`, `URL: ${url}\n`, "utf8");
+
+    await page.screenshot({ path: `${base}.png`, fullPage: true });
+
+    const html = await page.content();
+    fs.writeFileSync(`${base}.html`, html, "utf8");
+
+    console.error(`[DEBUG] wrote ${base}.png/.html/.txt`);
+  } catch (e) {
+    console.error(`[DEBUG] dumpDebug failed: ${e.message}`);
+  }
 }
 
 // =============================================================================
@@ -365,6 +297,7 @@ async function findElement(page, selectorType, options = {}) {
   }
 
   if (required) {
+    await dumpDebug(page, `missing-${selectorType}`);
     throw new LoginError(
       `Could not find ${selectorType} element after ${retries} attempts. ` +
       `Tried selectors: ${selectors.join(', ')}`,
@@ -554,14 +487,36 @@ async function extractCookies(context) {
     xsrfHeader,
     expiresAt,
     debugDomains: domains,
-    // Include raw cookies for storage state export (not in stdout output)
-    _rawCookies: domainCookies,
   };
 }
 
 // =============================================================================
 // Login Flow
 // =============================================================================
+
+async function isAlreadyLoggedIn(page) {
+  const url = page.url().toLowerCase();
+
+  // If we're already in /admin and not on /login, assume authenticated.
+  if (url.includes("/admin") && !url.includes("/login")) return true;
+
+  // If any of these selectors exist, it is almost certainly an authenticated app shell.
+  const authedSelectors = [
+    'a[href*="/logout"]',
+    'button:has-text("Logout")',
+    'text=Dashboard',
+    '[data-testid*="sidebar"]',
+    '[class*="sidebar"]'
+  ];
+
+  for (const sel of authedSelectors) {
+    try {
+      if (await page.locator(sel).first().isVisible({ timeout: 500 })) return true;
+    } catch {}
+  }
+
+  return false;
+}
 
 /**
  * Navigate to login page with retry logic
@@ -581,13 +536,8 @@ async function navigateToLogin(page) {
       }
 
       const status = response.status();
-      // Treat only 5xx as hard failure.
-      // 4xx (notably 405/409) may still return usable HTML/redirect behavior.
-      if (status >= 500) {
-        throw new Error(`HTTP ${status}`);
-      }
       if (status >= 400) {
-        warn(`Login URL returned HTTP ${status} (continuing)`);
+        throw new Error(`HTTP ${status}`);
       }
 
       await waitForStable(page);
@@ -695,52 +645,20 @@ async function verifyLoginWithSubdomain(page) {
  * Perform the complete login flow
  */
 async function performLogin(page, context) {
-  // Step 0: Try protected page first (best case: already authenticated)
-  log('Step: Try postLoginUrl first (session reuse)');
-  try {
-    const precheckResponse = await page.goto(CONFIG.postLoginUrl, {
-      waitUntil: 'commit',
-      timeout: CONFIG.timeout,
-    });
-    await page.waitForTimeout(1200);
-
-    const landedUrl = page.url();
-    const status = precheckResponse?.status() || 0;
-    log(`Landed on: ${landedUrl} (HTTP ${status})`);
-
-    // If we are not on a login page, assume session is valid.
-    if (!landedUrl.toLowerCase().includes('/login')) {
-      log('Session appears valid; extracting cookies');
-      return await extractCookies(context);
-    }
-  } catch (err) {
-    warn(`postLoginUrl pre-check failed: ${err.message} (continuing to login flow)`);
-  }
-
   // Step 1: Navigate to login page
   await navigateToLogin(page);
 
+  // NEW: if persistent profile already has a valid session, skip login form.
+  if (await isAlreadyLoggedIn(page)) {
+    log("Already logged in (session from persistent profile). Skipping credential entry.");
+    await verifyLoginWithSubdomain(page);
+    log("Step: Extract cookies");
+    return await extractCookies(context);
+  }
+
   // Step 2: Enter email
   log('Step: Enter email');
-  // If already on dashboard/admin and no email field appears quickly, treat as authenticated.
-  const quickEmail = await findElement(page, 'email', {
-    required: false,
-    timeout: 1500,
-    retries: 1,
-  });
-  if (!quickEmail) {
-    const currentUrl = page.url().toLowerCase();
-    if (!currentUrl.includes('/login')) {
-      log('No email field and not on login page; treating as already authenticated');
-      await verifyLoginWithSubdomain(page);
-      return await extractCookies(context);
-    }
-    throw new LoginError(
-      'Expected login page but no email field found.',
-      ERROR_CODES.SELECTOR_NOT_FOUND
-    );
-  }
-  const emailInput = quickEmail;
+  const emailInput = await findElement(page, 'email');
   await emailInput.click();
   await emailInput.fill(CONFIG.email);
 
@@ -884,258 +802,115 @@ async function runSmokeTest(page, context) {
 }
 
 // =============================================================================
-// Runner Auth Payload & Push
-// =============================================================================
-
-/**
- * Create runner auth payload suitable for POST /auth/cookies
- */
-function createRunnerAuthPayload(result) {
-  return {
-    cookieHeader: result.cookieHeader,
-    xsrfHeader: result.xsrfHeader,
-    expiresAt: result.expiresAt,
-  };
-}
-
-/**
- * Push auth payload to runner /auth/cookies endpoint
- */
-async function pushAuthToRunner(payload, runnerUrl, runnerToken) {
-  return new Promise((resolve, reject) => {
-    const url = new URL('/auth/cookies', runnerUrl);
-    const isHttps = url.protocol === 'https:';
-    const client = isHttps ? https : http;
-
-    const postData = JSON.stringify(payload);
-
-    const options = {
-      hostname: url.hostname,
-      port: url.port || (isHttps ? 443 : 80),
-      path: url.pathname,
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Content-Length': Buffer.byteLength(postData),
-        'Authorization': `Bearer ${runnerToken}`,
-      },
-    };
-
-    log(`Pushing auth to: ${url.toString()}`);
-
-    const req = client.request(options, (res) => {
-      let data = '';
-      res.on('data', (chunk) => { data += chunk; });
-      res.on('end', () => {
-        try {
-          const response = JSON.parse(data);
-          if (res.statusCode >= 200 && res.statusCode < 300) {
-            resolve({ statusCode: res.statusCode, body: response });
-          } else {
-            reject(new Error(`Runner returned ${res.statusCode}: ${JSON.stringify(response)}`));
-          }
-        } catch (e) {
-          reject(new Error(`Failed to parse runner response: ${data}`));
-        }
-      });
-    });
-
-    req.on('error', (e) => {
-      reject(new Error(`Failed to connect to runner: ${e.message}`));
-    });
-
-    req.write(postData);
-    req.end();
-  });
-}
-
-// =============================================================================
-// Playwright Storage State Export
-// =============================================================================
-
-/**
- * Convert browser cookies to Playwright storage state format
- */
-function createPlaywrightStorageState(cookies) {
-  // Convert to Playwright cookie format
-  const playwrightCookies = cookies.map((c) => ({
-    name: c.name,
-    value: c.value,
-    domain: c.domain,
-    path: c.path,
-    expires: c.expires,
-    httpOnly: c.httpOnly,
-    secure: c.secure,
-    sameSite: c.sameSite,
-  }));
-
-  return {
-    cookies: playwrightCookies,
-    origins: [],
-  };
-}
-
-/**
- * Export Playwright storage state to file
- */
-function exportStorageState(storageState, filePath) {
-  const content = JSON.stringify(storageState, null, 2);
-  fs.writeFileSync(filePath, content, { mode: 0o600 });
-  log(`Exported Playwright storage state to: ${filePath}`);
-  return {
-    path: filePath,
-    cookieCount: storageState.cookies.length,
-    cookieNames: [...new Set(storageState.cookies.map(c => c.name))],
-  };
-}
-
-// =============================================================================
 // Main Entry Point
 // =============================================================================
 
 async function main() {
-  // Show help if requested
-  if (CLI_ARGS.help) {
-    showHelp();
-    process.exit(0);
-  }
-
-  // Validate CLI args for push
-  if (CLI_ARGS.pushAuth) {
-    if (!CLI_ARGS.runnerUrl) {
-      fatal('--runner-url is required when using --push-auth', 'CONFIG_ERROR');
-    }
-    if (!CLI_ARGS.runnerToken) {
-      fatal('--runner-token is required when using --push-auth', 'CONFIG_ERROR');
-    }
-  }
-
-  // Validate configuration
   if (!CONFIG.smokeTest) {
-    if (!CONFIG.email) {
-      fatal('ARYEO_EMAIL environment variable is required', 'CONFIG_ERROR');
-    }
-    if (!CONFIG.password) {
-      fatal('ARYEO_PASSWORD environment variable is required', 'CONFIG_ERROR');
-    }
+    if (!CONFIG.email) fatal("ARYEO_EMAIL environment variable is required", "CONFIG_ERROR");
+    if (!CONFIG.password) fatal("ARYEO_PASSWORD environment variable is required", "CONFIG_ERROR");
   }
 
-  let browser = null;
+  const profileDir = process.env.ARYEO_PROFILE_DIR || "/home/pw/profile";
+  let context = null;
 
   try {
-    log('Launching browser...');
-    browser = await chromium.launch({
+    log(`Launching persistent context at: ${profileDir}`);
+
+    context = await chromium.launchPersistentContext(profileDir, {
       headless: CONFIG.headless,
       args: [
-        '--disable-blink-features=AutomationControlled',
-        '--disable-dev-shm-usage',
-        '--no-sandbox',
+        "--no-sandbox",
+        "--disable-dev-shm-usage",
+        "--disable-blink-features=AutomationControlled",
       ],
-    });
-
-    const context = await browser.newContext({
-      userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
       viewport: { width: 1280, height: 720 },
-      locale: 'en-US',
-      timezoneId: 'America/New_York',
+      locale: "en-US",
+      timezoneId: "America/New_York",
+      userAgent:
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     });
 
-    const page = await context.newPage();
+    const page = context.pages()[0] || (await context.newPage());
     page.setDefaultTimeout(CONFIG.timeout);
 
-    let result;
+    const captured = [];
 
-    if (CONFIG.smokeTest) {
-      result = await runSmokeTest(page, context);
-    } else {
-      result = await performLogin(page, context);
+    if (CAPTURE_NETWORK) {
+      page.on("request", (req) => {
+        const url = req.url();
+        const method = req.method();
+        if (url.includes("aryeo.com")) {
+          captured.push({ t: "req", method, url, resource: req.resourceType() });
+        }
+      });
+
+      page.on("response", async (res) => {
+        const url = res.url();
+        const status = res.status();
+        const ct = (res.headers()["content-type"] || "");
+        if (url.includes("aryeo.com")) {
+          captured.push({ t: "res", status, url, contentType: ct });
+        }
+      });
     }
 
-    // Extract raw cookies before cleaning result for output
-    const rawCookies = result._rawCookies;
-    delete result._rawCookies;
-
-    // Handle --output-payload: save runner auth payload to file
-    if (CLI_ARGS.outputPayload && !CONFIG.smokeTest) {
-      const payload = createRunnerAuthPayload(result);
-      fs.writeFileSync(CLI_ARGS.outputPayload, JSON.stringify(payload, null, 2), { mode: 0o600 });
-      log(`Runner auth payload saved to: ${CLI_ARGS.outputPayload}`);
-      console.error(`[INFO] Saved runner auth payload to: ${CLI_ARGS.outputPayload}`);
+    if (CAPTURE_NETWORK) {
+      // ensure logged in (your existing login short-circuit should handle this)
+      await page.goto(CAPTURE_URL, { waitUntil: "commit", timeout: CONFIG.timeout });
+      await page.waitForTimeout(5000); // let XHRs fire
+      console.log(JSON.stringify({ captureUrl: CAPTURE_URL, captured }, null, 2));
+      await context.close();
+      process.exit(0);
     }
 
-    // Handle --push-auth: POST to runner /auth/cookies
-    if (CLI_ARGS.pushAuth && !CONFIG.smokeTest) {
-      const payload = createRunnerAuthPayload(result);
-      try {
-        const pushResult = await pushAuthToRunner(payload, CLI_ARGS.runnerUrl, CLI_ARGS.runnerToken);
-        console.error(`[INFO] Runner push successful: ${pushResult.body.cookieCount} cookies, names: ${pushResult.body.cookieNames?.join(', ') || 'N/A'}`);
-      } catch (pushErr) {
-        error(`Runner push failed: ${pushErr.message}`, 'RUNNER_PUSH_FAILED');
-        // Don't exit - still output the result
-      }
+    const result = CONFIG.smokeTest
+      ? await runSmokeTest(page, context)
+      : await performLogin(page, context);
+
+    // Persist state (optional but useful)
+    try {
+      await context.storageState({ path: `${profileDir}/storageState.json` });
+    } catch (e) {
+      warn(`Could not write storageState.json: ${e.message}`);
     }
 
-    // Handle --export-storage-state: export Playwright storage state
-    if (CLI_ARGS.exportStorageState && !CONFIG.smokeTest && rawCookies) {
-      const storageState = createPlaywrightStorageState(rawCookies);
-      const exportResult = exportStorageState(storageState, CLI_ARGS.exportStorageState);
-      console.error(`[INFO] Exported storage state: ${exportResult.cookieCount} cookies to ${exportResult.path}`);
-    }
-
-    // Add playwrightStorageState to output if we have raw cookies (for backward compat with README examples)
-    if (rawCookies && !CONFIG.smokeTest) {
-      result.playwrightStorageState = createPlaywrightStorageState(rawCookies);
-    }
-
-    // Output result as JSON to stdout
     console.log(JSON.stringify(result, null, 2));
-
-    await browser.close();
+    await context.close();
     process.exit(0);
-
   } catch (err) {
-    const code = err.code || 'UNKNOWN_ERROR';
+    const code = err.code || "UNKNOWN_ERROR";
     error(err.message, code);
 
     if (CONFIG.debug && err.stack) {
-      console.error('\nStack trace:');
+      console.error("\nStack trace:");
       console.error(err.stack);
     }
 
-    // Provide actionable guidance based on error type
     switch (code) {
       case ERROR_CODES.PAGE_UNREACHABLE:
-        console.error('\nAction: Check network connectivity and verify the login URL is correct.');
+        console.error("\nAction: Check network connectivity and verify the login URL is correct.");
         break;
       case ERROR_CODES.CREDENTIAL_REJECTED:
-        console.error('\nAction: Verify ARYEO_EMAIL and ARYEO_PASSWORD are correct.');
+        console.error("\nAction: Verify email/password are correct.");
         break;
       case ERROR_CODES.VERIFICATION_REQUIRED:
-        console.error('\nAction: Provide ARYEO_OTP or ARYEO_TOTP_SECRET for MFA.');
+        console.error("\nAction: Provide otp or totpSecret.");
         break;
       case ERROR_CODES.OTP_FAILED:
-        console.error('\nAction: Check TOTP secret or provide a fresh manual OTP code.');
+        console.error("\nAction: Check TOTP secret or provide a fresh manual OTP code.");
         break;
       case ERROR_CODES.COOKIES_NOT_SET:
-        console.error('\nAction: Run smoke test (ARYEO_SMOKE_TEST=1) to diagnose cookie issues.');
-        break;
-      case ERROR_CODES.COOKIE_DECODE_FAILED:
-        console.error('\nAction: XSRF token has invalid encoding. This may indicate a server issue.');
+        console.error("\nAction: Run smoke test (ARYEO_SMOKE_TEST=1) to diagnose cookie issues.");
         break;
       case ERROR_CODES.REDIRECT_TO_LOGIN:
-        console.error('\nAction: Login succeeded but session is not valid. Cookies may not work across subdomains.');
-        break;
       case ERROR_CODES.SESSION_INVALID:
-        console.error('\nAction: Session may have expired or cookies are not cross-subdomain. Retry login.');
+        console.error("\nAction: Session invalid; retry login.");
         break;
     }
 
-    if (browser) {
-      try {
-        await browser.close();
-      } catch {
-        // Ignore close errors
-      }
+    if (context) {
+      try { await context.close(); } catch {}
     }
 
     process.exit(1);
