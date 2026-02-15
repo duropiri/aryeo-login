@@ -20,7 +20,7 @@ const CONFIG = {
   password: process.env.ARYEO_PASSWORD,
   otp: process.env.ARYEO_OTP,
   totpSecret: process.env.ARYEO_TOTP_SECRET,
-  loginUrl: process.env.ARYEO_LOGIN_URL || 'https://app.aryeo.com/login',
+  loginUrl: process.env.ARYEO_LOGIN_URL || 'https://virtual-xposure.aryeo.com/admin/dashboard',
   postLoginUrl: process.env.ARYEO_POST_LOGIN_URL || 'https://virtual-xposure.aryeo.com/admin/mileage',
   smokeTest: process.env.ARYEO_SMOKE_TEST === '1',
   headless: process.env.ARYEO_HEADLESS !== '0',
@@ -536,8 +536,13 @@ async function navigateToLogin(page) {
       }
 
       const status = response.status();
-      if (status >= 400) {
+      // Don't treat 4xx as unreachable. Aryeo may return 405 on some routes.
+      // Only 5xx should be considered hard failures here.
+      if (status >= 500) {
         throw new Error(`HTTP ${status}`);
+      }
+      if (status >= 400) {
+        warn(`Login URL returned HTTP ${status} (continuing)`);
       }
 
       await waitForStable(page);
